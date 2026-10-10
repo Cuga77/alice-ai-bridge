@@ -24,10 +24,12 @@ import (
 
 type aliceReq struct {
 	Request struct {
-		Command string `json:"command"`
+		Command           string `json:"command"`
+		OriginalUtterance string `json:"original_utterance"`
 	} `json:"request"`
 	Session struct {
 		SessionID   string `json:"session_id"`
+		SkillID     string `json:"skill_id"`
 		MessageID   int    `json:"message_id"`
 		UserID      string `json:"user_id"`
 		Application struct {
@@ -57,11 +59,13 @@ type chatMsg struct {
 }
 
 var (
+	dotenv = loadDotenv(os.Getenv("ENV_FILE"))
+
 	baseURL   = strings.TrimRight(getenv("LLM_BASE_URL", "http://localhost:11434/v1"), "/")
-	apiKey    = os.Getenv("LLM_API_KEY")
+	apiKey    = getenv("LLM_API_KEY", "")
 	model     = getenv("LLM_MODEL", "gemma3:1b")
 	system    = getenv("LLM_SYSTEM", "Отвечай по-русски, кратко и по делу, обычным текстом без markdown и списков.")
-	reasoning = os.Getenv("LLM_REASONING_EFFORT")
+	reasoning = getenv("LLM_REASONING_EFFORT", "")
 	maxTokens = getenvInt("LLM_MAX_TOKENS", 300)
 	timeout   = time.Duration(getenvInt("LLM_TIMEOUT_MS", 2500)) * time.Millisecond
 	genTime   = time.Duration(getenvInt("LLM_GEN_TIMEOUT_MS", 60000)) * time.Millisecond
@@ -69,6 +73,7 @@ var (
 	historyN  = getenvInt("HISTORY_TURNS", 5)
 	listen    = getenv("LISTEN_ADDR", ":8080")
 	path      = getenv("WEBHOOK_PATH", "/alice")
+	skillIDs  = strings.FieldsFunc(getenv("ALLOWED_SKILL_ID", ""), func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 
 	client = &http.Client{Transport: &http.Transport{
 		MaxIdleConnsPerHost: 32,
@@ -80,15 +85,50 @@ var (
 	hist = newHistory(10 * time.Minute)
 )
 
+// loadDotenv reads KEY=VALUE lines from a .env file; a missing file is not an error.
+func loadDotenv(name string) map[string]string {
+	if name == "" {
+		name = ".env"
+	}
+	vars := map[string]string{}
+	data, err := os.ReadFile(name)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("env file %s: %v", name, err)
+		}
+		return vars
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(strings.TrimPrefix(line, "export "), "=")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		vars[strings.TrimSpace(k)] = v
+	}
+	return vars
+}
+
+// getenv prefers the process environment over the .env file.
 func getenv(k, d string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	if v := dotenv[k]; v != "" {
 		return v
 	}
 	return d
 }
 
 func getenvInt(k string, d int) int {
-	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+	if v, err := strconv.Atoi(getenv(k, "")); err == nil {
 		return v
 	}
 	return d
@@ -482,6 +522,13 @@ func reply(ctx context.Context, in *aliceReq) (string, bool) {
 		}
 	}
 
+	// command is lowercased and stripped of punctuation; prefer the original phrase
+	// unless it also contains the activation part ("запусти навык …").
+	prompt := cmd
+	if orig := strings.TrimSpace(in.Request.OriginalUtterance); orig != "" && normalize(orig) == normalize(cmd) {
+		prompt = orig
+	}
+
 	uid := in.Session.UserID
 	if uid == "" {
 		uid = in.Session.Application.ApplicationID
@@ -491,9 +538,16 @@ func reply(ctx context.Context, in *aliceReq) (string, bool) {
 	}
 
 	hist.stopPending(sid)
-	a := startAnswer(sid, cmd)
+	a := startAnswer(sid, prompt)
 	hist.setPending(sid, a)
 	return speak(ctx, sid, a), false
+}
+
+func normalize(s string) string {
+	s = strings.ReplaceAll(strings.ToLower(s), "ё", "е")
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}), " ")
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -504,6 +558,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	var in aliceReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&in); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(skillIDs) > 0 && !slices.Contains(skillIDs, in.Session.SkillID) {
+		log.Printf("rejected request from skill %q", in.Session.SkillID)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -540,6 +599,9 @@ func main() {
 
 	go func() {
 		log.Printf("listening on %s%s, llm: %s model=%s", listen, path, baseURL, model)
+		if len(skillIDs) == 0 {
+			log.Print("warning: ALLOWED_SKILL_ID is not set, requests from any skill are accepted")
+		}
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
