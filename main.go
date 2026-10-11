@@ -12,20 +12,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata" // embedded time zones for minimal images without system tzdata
 	"unicode"
 	"unicode/utf8"
 )
 
 type aliceReq struct {
+	Meta struct {
+		Timezone string `json:"timezone"`
+	} `json:"meta"`
 	Request struct {
 		Command           string `json:"command"`
 		OriginalUtterance string `json:"original_utterance"`
+		Markup            struct {
+			DangerousContext bool `json:"dangerous_context"`
+		} `json:"markup"`
 	} `json:"request"`
 	Session struct {
 		SessionID   string `json:"session_id"`
@@ -64,7 +72,7 @@ var (
 	baseURL   = strings.TrimRight(getenv("LLM_BASE_URL", "http://localhost:11434/v1"), "/")
 	apiKey    = getenv("LLM_API_KEY", "")
 	model     = getenv("LLM_MODEL", "gemma3:1b")
-	system    = getenv("LLM_SYSTEM", "Отвечай по-русски, кратко и по делу, обычным текстом без markdown и списков.")
+	system    = getenv("LLM_SYSTEM", "Отвечай по-русски, кратко и по делу. Ответ зачитает голосовой помощник, поэтому пиши так, как говорят вслух: без markdown, списков, эмодзи, ссылок и сокращений.")
 	reasoning = getenv("LLM_REASONING_EFFORT", "")
 	maxTokens = getenvInt("LLM_MAX_TOKENS", 300)
 	timeout   = time.Duration(getenvInt("LLM_TIMEOUT_MS", 2500)) * time.Millisecond
@@ -73,6 +81,8 @@ var (
 	historyN  = getenvInt("HISTORY_TURNS", 5)
 	listen    = getenv("LISTEN_ADDR", ":8080")
 	path      = getenv("WEBHOOK_PATH", "/alice")
+	tzName    = getenv("TIMEZONE", "")
+	danger    = getenv("DANGER_REPLY", "Я не могу помочь с этим. Если тебе тяжело или кто-то в опасности, поговори с близкими или позвони в экстренные службы по номеру 112.")
 	skillIDs  = strings.FieldsFunc(getenv("ALLOWED_SKILL_ID", ""), func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 
 	client = &http.Client{Transport: &http.Transport{
@@ -80,6 +90,23 @@ var (
 		IdleConnTimeout:     90 * time.Second,
 	}}
 	mdCleaner = strings.NewReplacer("**", "", "__", "", "`", "", "#", "")
+
+	urlRe     = regexp.MustCompile(`https?://\S+|www\.\S+`)
+	mdLinkRe  = regexp.MustCompile(`\[([^\]]+)\]\([^)]*\)`)
+	spacePunc = regexp.MustCompile(`\s+([.,!?;:])`)
+	abbrevFix = strings.NewReplacer(
+		"т.е.", "то есть", "т. е.", "то есть",
+		"т.к.", "так как", "т. к.", "так как",
+		"и т.д.,", "и так далее,", "и т. д.,", "и так далее,",
+		"и т.п.,", "и тому подобное,", "и т. п.,", "и тому подобное,",
+		"и т.д.", "и так далее.", "и т. д.", "и так далее.",
+		"и т.п.", "и тому подобное.", "и т. п.", "и тому подобное.",
+		"напр.", "например",
+	)
+
+	// Background generations: cancelled and awaited on shutdown.
+	genCtx, stopGen = context.WithCancel(context.Background())
+	gens            sync.WaitGroup
 
 	lim  = newLimiter(getenvInt("RATE_PER_MIN", 10), time.Minute)
 	hist = newHistory(10 * time.Minute)
@@ -329,7 +356,8 @@ func (a *answer) next(ctx context.Context, budget time.Duration) (chunk string, 
 		break
 	}
 	defer a.mu.Unlock()
-	rest := a.text[a.sent:]
+	rest := abbrevFix.Replace(a.text[a.sent:])
+	a.text = a.text[:a.sent] + rest
 	n := cut(rest, a.done)
 	a.sent += n
 	return rest[:n], !a.done || a.sent < len(a.text), a.err
@@ -373,20 +401,25 @@ func runeOffset(s string, n int) int {
 	return -1
 }
 
-func startAnswer(sid, prompt string) *answer {
+func startAnswer(sid, sys, prompt string) *answer {
 	past := hist.get(sid)
-	ctx, cancel := context.WithTimeout(context.Background(), genTime)
+	ctx, cancel := context.WithTimeout(genCtx, genTime)
 	a := &answer{changed: make(chan struct{}), cancel: cancel, finished: make(chan struct{})}
+	gens.Add(1)
 	go func() {
+		defer gens.Done()
 		defer close(a.finished)
 		defer cancel()
 		start := time.Now()
-		err := streamLLM(ctx, past, prompt, a.append)
+		err := streamLLM(ctx, past, sys, prompt, a.append)
 		full := strings.TrimSpace(a.finish(err))
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("llm error after %v (%d chars): %v", time.Since(start), len(full), err)
-		} else {
-			log.Printf("llm done in %v (%d chars)", time.Since(start), len(full))
+		switch {
+		case errors.Is(err, context.Canceled):
+			log.Printf("%s llm cancelled after %v (%d chars)", short(sid), time.Since(start).Round(time.Millisecond), len([]rune(full)))
+		case err != nil:
+			log.Printf("%s llm error after %v (%d chars): %v", short(sid), time.Since(start).Round(time.Millisecond), len([]rune(full)), err)
+		default:
+			log.Printf("%s llm done in %v (%d chars)", short(sid), time.Since(start).Round(time.Millisecond), len([]rune(full)))
 		}
 		if full != "" {
 			hist.add(sid, chatMsg{Role: "user", Content: prompt}, chatMsg{Role: "assistant", Content: full})
@@ -395,9 +428,9 @@ func startAnswer(sid, prompt string) *answer {
 	return a
 }
 
-func streamLLM(ctx context.Context, past []chatMsg, prompt string, onDelta func(string)) error {
+func streamLLM(ctx context.Context, past []chatMsg, sys, prompt string, onDelta func(string)) error {
 	msgs := make([]chatMsg, 0, len(past)+2)
-	msgs = append(msgs, chatMsg{Role: "system", Content: system})
+	msgs = append(msgs, chatMsg{Role: "system", Content: sys})
 	msgs = append(msgs, past...)
 	msgs = append(msgs, chatMsg{Role: "user", Content: prompt})
 
@@ -463,7 +496,41 @@ func streamLLM(ctx context.Context, past []chatMsg, prompt string, onDelta func(
 	return ctx.Err()
 }
 
+var (
+	weekdays = [...]string{"воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"}
+	months   = [...]string{"января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"}
+)
+
+// systemPrompt adds the current date and time: the model has no clock of its own.
+func systemPrompt(tz string) string {
+	if tzName != "" {
+		tz = tzName
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil || tz == "" {
+		loc = time.UTC
+	}
+	now := time.Now().In(loc)
+	return fmt.Sprintf("%s\nСейчас %s, %d %s %d года, %02d:%02d (часовой пояс %s).",
+		system, weekdays[now.Weekday()], now.Day(), months[now.Month()-1], now.Year(), now.Hour(), now.Minute(), loc)
+}
+
+// isEmoji reports pictographs and emoji modifiers; ordinary symbols like ° and № are kept.
+func isEmoji(r rune) bool {
+	return r >= 0x1F000 || (r >= 0x2600 && r <= 0x27BF) || (r >= 0x2300 && r <= 0x23FF) ||
+		r == 0x2B50 || r == 0x2B55 || r == 0xFE0F || r == 0x200D
+}
+
+// clean turns model output into plain speech: no markdown, links or emoji; list items become sentences.
 func clean(s string) string {
+	s = mdLinkRe.ReplaceAllString(s, "$1")
+	s = urlRe.ReplaceAllString(s, "")
+	s = strings.Map(func(r rune) rune {
+		if isEmoji(r) {
+			return -1
+		}
+		return r
+	}, s)
 	var parts []string
 	for _, line := range strings.Split(mdCleaner.Replace(s), "\n") {
 		line = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "*-•·"))
@@ -475,12 +542,30 @@ func clean(s string) string {
 		}
 		parts = append(parts, line)
 	}
-	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
+	return spacePunc.ReplaceAllString(strings.Join(strings.Fields(strings.Join(parts, " ")), " "), "$1")
 }
 
-func speak(ctx context.Context, sid string, a *answer) string {
+func short(sid string) string {
+	if len(sid) > 8 {
+		return sid[:8]
+	}
+	return sid
+}
+
+func speak(ctx context.Context, sid, kind string, a *answer) string {
+	start := time.Now()
 	chunk, more, err := a.next(ctx, timeout)
 	chunk = clean(chunk)
+	state := "last"
+	switch {
+	case chunk == "" && more:
+		state = "still thinking"
+	case chunk == "":
+		state = "empty"
+	case more:
+		state = "more"
+	}
+	log.Printf("%s %s: %d chars in %v (%s)", short(sid), kind, utf8.RuneCountInString(chunk), time.Since(start).Round(time.Millisecond), state)
 	switch {
 	case chunk != "" && more:
 		return chunk + " Продолжить?"
@@ -515,7 +600,7 @@ func reply(ctx context.Context, in *aliceReq) (string, bool) {
 		return "Начинаем заново.", false
 	case "дальше", "продолжи", "продолжай", "да", "ещё", "еще", "давай":
 		if a := hist.pending(sid); a != nil {
-			return speak(ctx, sid, a), false
+			return speak(ctx, sid, "continue", a), false
 		}
 		if cmd != "да" && cmd != "давай" {
 			return "Продолжать нечего. Задай вопрос.", false
@@ -538,9 +623,13 @@ func reply(ctx context.Context, in *aliceReq) (string, bool) {
 	}
 
 	hist.stopPending(sid)
-	a := startAnswer(sid, prompt)
+	if in.Request.Markup.DangerousContext {
+		log.Printf("%s dangerous_context: fixed reply", short(sid))
+		return danger, false
+	}
+	a := startAnswer(sid, systemPrompt(in.Meta.Timezone), prompt)
 	hist.setPending(sid, a)
-	return speak(ctx, sid, a), false
+	return speak(ctx, sid, "answer", a), false
 }
 
 func normalize(s string) string {
@@ -613,4 +702,13 @@ func main() {
 	if err := srv.Shutdown(shCtx); err != nil {
 		log.Println("shutdown:", err)
 	}
+	stopGen()
+	done := make(chan struct{})
+	go func() { gens.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-shCtx.Done():
+		log.Println("shutdown: background generations did not finish in time")
+	}
+	log.Println("stopped")
 }
