@@ -464,7 +464,7 @@ func streamLLM(ctx context.Context, past []chatMsg, sys, prompt string, onDelta 
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-		return fmt.Errorf("llm status %d: %s", res.StatusCode, msg)
+		return fmt.Errorf("llm status %d: %s", res.StatusCode, strings.Join(strings.Fields(string(msg)), " "))
 	}
 
 	sc := bufio.NewScanner(res.Body)

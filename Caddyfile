@@ -1,0 +1,4 @@
+# HTTPS с автоматическим сертификатом Let's Encrypt для домена из DOMAIN.
+{$DOMAIN} {
+	reverse_proxy bridge:8080
+}

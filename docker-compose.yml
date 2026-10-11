@@ -1,6 +1,31 @@
+# Какие сервисы запускать, задаётся в .env через COMPOSE_PROFILES:
+#   ollama — локальная модель (Ollama),
+#   caddy  — HTTPS для VPS с доменом (вместо туннеля).
+# Мост (bridge) запускается всегда.
+
 services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Внутри Docker Ollama доступна по имени сервиса, а не через localhost.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      # Время в логах — в том же часовом поясе, что и в ответах.
+      TZ: ${TIMEZONE:-UTC}
+    ports:
+      # Только для localhost: туннель (tuna, cloudflared) или Caddy.
+      - "127.0.0.1:${BRIDGE_PORT:-8080}:8080"
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false
+
   ollama:
     image: ollama/ollama:latest
+    profiles: [ollama]
     restart: unless-stopped
     ports:
       - "127.0.0.1:11434:11434"
@@ -20,6 +45,7 @@ services:
   # Одноразово скачивает модель и прогревает её, затем завершается.
   ollama-pull:
     image: ollama/ollama:latest
+    profiles: [ollama]
     depends_on:
       ollama:
         condition: service_healthy
@@ -29,5 +55,21 @@ services:
     entrypoint: ["sh", "-c", "ollama pull \"$$MODEL\" && ollama run \"$$MODEL\" '' >/dev/null"]
     restart: "no"
 
+  caddy:
+    image: caddy:2
+    profiles: [caddy]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}  # обязателен для этого профиля
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - bridge
+
 volumes:
   ollama:
+  caddy_data:
